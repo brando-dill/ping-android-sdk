@@ -116,11 +116,11 @@ class OathClientAndroidTest {
     @Test
     fun testCreateOathClientWithMfaConfigurationObject() = runTest {
         // Create an OathClient with a MfaConfiguration object
-        val config = MfaConfiguration.Builder()
-            .enableCredentialCache(true)
-            .timeoutMs(60_000L)
-            .encryptionEnabled(false)
-            .build()
+        val config = MfaConfiguration {
+            enableCredentialCache = true
+            timeoutMs = 60_000L
+            encryptionEnabled = false
+        }
 
         val client = OathClient.create(config)
 

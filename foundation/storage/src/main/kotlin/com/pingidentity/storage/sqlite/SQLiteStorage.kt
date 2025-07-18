@@ -13,11 +13,12 @@ import com.pingidentity.storage.exception.StorageException
 import com.pingidentity.storage.sqlite.passphrase.KeyStorePassphraseProvider
 import com.pingidentity.storage.sqlite.passphrase.PassphraseProvider
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.json.Json
 import net.sqlcipher.Cursor
 import net.sqlcipher.database.SQLiteDatabase
 import net.sqlcipher.database.SQLiteOpenHelper
+import kotlin.coroutines.coroutineContext
 
 /**
  * Base implementation for SQLite storage that uses SQLCipher for encrypted storage.
@@ -40,16 +41,10 @@ open class SQLiteStorage(
     }
 
     // List of table creator functions
-    protected val tableCreators = mutableListOf<(SQLiteDatabase) -> Unit>()
+    private val tableCreators = mutableListOf<(SQLiteDatabase) -> Unit>()
 
     // Database helper for managing the SQLite database
     protected lateinit var dbHelper: SQLiteOpenHelper
-
-    // JSON serialization for storage
-    protected val json = Json {
-        ignoreUnknownKeys = true
-        isLenient = true
-    }
 
     // Internal database property to be accessed through the getter
     private lateinit var internalDatabase: SQLiteDatabase
@@ -65,7 +60,7 @@ open class SQLiteStorage(
      *
      * @throws StorageException if the database cannot be opened or the tables cannot be created.
      */
-    suspend fun initializeDatabase() {
+    suspend fun initializeDatabase() = executeOnIO {
         try {
             // Load SQLCipher libraries
             SQLiteDatabase.loadLibs(context)
@@ -81,8 +76,10 @@ open class SQLiteStorage(
                 // Open or create the database
                 internalDatabase = dbHelper.getWritableDatabase(passphrase)
             } catch (e: Exception) {
+                coroutineContext.ensureActive()
+                
                 // If opening fails, try to recover
-                logger.e("Database initialization failed: ${e.message}")
+                logger.e("Database initialization failed: ${e.message}", e)
                 closeAndCleanupDatabase()
                 
                 // Create a new helper and try again
@@ -100,10 +97,12 @@ open class SQLiteStorage(
                 try {
                     creator(internalDatabase)
                 } catch (e: Exception) {
+                    coroutineContext.ensureActive()
                     logger.e("Failed to create table: ${e.message}", e)
                 }
             }
         } catch (e: Exception) {
+            coroutineContext.ensureActive()
             logger.e("Failed to initialize database: ${e.message}", e)
             throw StorageException("Failed to initialize database", e)
         }
@@ -129,104 +128,100 @@ open class SQLiteStorage(
     /**
      * Validate that the database is properly initialized by running a simple query.
      */
-    private fun validateDatabaseInitialization() {
-        if (!internalDatabase.isOpen) {
-            throw StorageException("Database was not opened successfully")
-        }
-
-        try {
-            // Try a simple SQLite query to validate db is operational
-            internalDatabase.rawQuery("SELECT count(*) FROM sqlite_master", null).use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val count = cursor.getInt(0)
-                    logger.d("Database validation query successful, found $count tables")
-                }
+    private suspend fun validateDatabaseInitialization() {
+        executeOnIO {
+            if (!internalDatabase.isOpen) {
+                throw StorageException("Database was not opened successfully")
             }
-        } catch (e: Exception) {
-            logger.e("Database validation query failed: ${e.message}", e)
-            closeAndCleanupDatabase()
-            throw e
+
+            try {
+                // Try a simple SQLite query to validate db is operational
+                internalDatabase.rawQuery("SELECT count(*) FROM sqlite_master", null).use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val count = cursor.getInt(0)
+                        logger.d("Database validation query successful, found $count tables")
+                    }
+                }
+            } catch (e: Exception) {
+                coroutineContext.ensureActive()
+                logger.e("Database validation query failed: ${e.message}", e)
+                closeAndCleanupDatabase()
+                throw e
+            }
         }
     }
 
     /**
      * Close and cleanup database resources.
      */
-    private fun closeAndCleanupDatabase() {
-        // Attempt to close internalDatabase
-        try {
-            if (::internalDatabase.isInitialized && internalDatabase.isOpen) {
-                internalDatabase.use { /* it.close() is called automatically */ }
+    private suspend fun closeAndCleanupDatabase() {
+        executeOnIO {
+            // Attempt to close internalDatabase
+            try {
+                if (::internalDatabase.isInitialized && internalDatabase.isOpen) {
+                    internalDatabase.use { /* it.close() is called automatically */ }
+                }
+            } catch (e: Exception) {
+                coroutineContext.ensureActive()
+                logger.e("Error during internalDatabase.close(): ${e.message}", e)
             }
-        } catch (e: Exception) {
-            logger.e("Error during internalDatabase.close(): ${e.message}", e)
-        }
 
-        // Attempt to close dbHelper
-        try {
-            if (::dbHelper.isInitialized) {
-                dbHelper.close()
+            // Attempt to close dbHelper
+            try {
+                if (::dbHelper.isInitialized) {
+                    dbHelper.close()
+                }
+            } catch (e: Exception) {
+                coroutineContext.ensureActive()
+                logger.e("Error during dbHelper.close(): ${e.message}", e)
             }
-        } catch (e: Exception) {
-            logger.e("Error during dbHelper.close(): ${e.message}", e)
-        }
 
-        // Delete the database file
-        try {
-            context.deleteDatabase(databaseName)
-            logger.d("Database file deleted successfully")
-        } catch (e: Exception) {
-            logger.e("Failed to delete database file: ${e.message}", e)
-        }
+            // Delete the database file
+            try {
+                context.deleteDatabase(databaseName)
+                logger.d("Database file deleted successfully")
+            } catch (e: Exception) {
+                coroutineContext.ensureActive()
+                logger.e("Failed to delete database file: ${e.message}", e)
+            }
 
-        // Re-initialize the properties - we need to be careful to set up new instances
-        // since these are now lateinit
-        initializeEmptyInstances()
+            // Re-initialize the properties - we need to be careful to set up new instances
+            // since these are now lateinit
+            initializeEmptyInstances()
+        }
     }
 
     /**
      * Initialize empty instances for lateinit properties after cleanup.
      * This is needed because we can't directly set lateinit properties to null.
      */
-    private fun initializeEmptyInstances() {
-        // Create temporary instances to satisfy lateinit requirements
-        dbHelper = createDatabaseHelper(context, databaseName, databaseVersion)
-        try {
-            internalDatabase = dbHelper.getReadableDatabase("")
-            internalDatabase.close()
-        } catch (e: Exception) {
-            logger.e("Failed to create temporary database instance: ${e.message}", e)
-        }
-    }
-
-    /**
-     * Clear data from all registered tables in the database.
-     *
-     * @throws StorageException if the database cannot be cleared.
-     */
-    fun clearDatabase() {
-        try {
-            // Execute a more general clear approach
-            // This will rely on subclasses implementing their own clear logic
-            // for their specific tables
-            logger.d("Base clear method called - subclasses should override this")
-        } catch (e: Exception) {
-            logger.e("Failed to clear database: ${e.message}", e)
-            throw StorageException("Failed to clear database", e)
+    private suspend fun initializeEmptyInstances() {
+        executeOnIO {
+            // Create temporary instances to satisfy lateinit requirements
+            dbHelper = createDatabaseHelper(context, databaseName, databaseVersion)
+            try {
+                internalDatabase = dbHelper.getReadableDatabase("")
+                internalDatabase.close()
+            } catch (e: Exception) {
+                coroutineContext.ensureActive()
+                logger.e("Failed to create temporary database instance: ${e.message}", e)
+            }
         }
     }
 
     /**
      * Close the database connection.
      */
-    fun closeDatabase() {
-        internalDatabase.close()
-        dbHelper.close()
+    suspend fun closeDatabase() {
+        executeOnIO {
+            internalDatabase.close()
+            dbHelper.close()
+            
+            logger.d("SQL storage closed")
+        }
         
         // Reinitialize with empty instances to satisfy lateinit requirements
         initializeEmptyInstances()
-        
-        logger.d("SQL storage closed")
     }
 
     /**
@@ -271,6 +266,7 @@ open class SQLiteStorage(
 
                 logger.d("Stored item of type '$type' with ID: $id in table: $tableName")
             } catch (e: Exception) {
+                coroutineContext.ensureActive()
                 logger.e("Failed to store item of type '$type' with ID $id in table $tableName: ${e.message}", e)
                 throw StorageException("Failed to store item of type '$type' with ID $id in table $tableName", e)
             }
@@ -305,6 +301,7 @@ open class SQLiteStorage(
                 // Item not found
                 return@executeOnIO null
             } catch (e: Exception) {
+                coroutineContext.ensureActive()
                 logger.e("Failed to retrieve item of type '$type' with ID $id from table $tableName: ${e.message}", e)
                 throw StorageException("Failed to retrieve item of type '$type' with ID $id from table $tableName", e)
             }
@@ -339,6 +336,7 @@ open class SQLiteStorage(
 
                 return@executeOnIO items
             } catch (e: Exception) {
+                coroutineContext.ensureActive()
                 logger.e("Failed to retrieve all items of type '$type' from table $tableName: ${e.message}", e)
                 throw StorageException("Failed to retrieve all items of type '$type' from table $tableName", e)
             }
@@ -376,6 +374,7 @@ open class SQLiteStorage(
 
                 return@executeOnIO wasDeleted
             } catch (e: Exception) {
+                coroutineContext.ensureActive()
                 logger.e("Failed to delete item of type '$type' with ID $id from table $tableName: ${e.message}", e)
                 throw StorageException("Failed to delete item of type '$type' with ID $id from table $tableName", e)
             }
@@ -404,6 +403,7 @@ open class SQLiteStorage(
 
                 logger.d("Cleared all items of type: $type from table $tableName")
             } catch (e: Exception) {
+                coroutineContext.ensureActive()
                 logger.e("Failed to clear items of type '$type' from table $tableName: ${e.message}", e)
                 throw StorageException("Failed to clear items of type '$type' from table $tableName", e)
             }
